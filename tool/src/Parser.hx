@@ -90,6 +90,19 @@ class Parser
 				// force exploring both right and left of expression
 				cont(node.right, state);
 				cont(node.left, state);
+			},
+			NewExpression: function(node:AstNode, state, cont) {
+				if (node.callee != null && node.callee.type == 'Identifier') {
+					final name = node.callee.name;
+					if (name != id && types.exists(name)) {
+						g.setEdge(id, name);
+						refs++;
+					}
+				}
+				if (node.callee != null) cont(node.callee, state);
+				if (node.arguments != null) {
+					for (arg in node.arguments) cont(arg, state);
+				}
 			}
 		};
 		for (decl in nodes) ast.Acorn.Walk.recursive(decl, {}, visitors);
@@ -173,14 +186,15 @@ class Parser
 
 	function inspectBlockStatement(def:AstNode)
 	{
-		// Top-level blocks are created since Haxe 4.2+ for static _init_ code in ES6
-		// We'll attempt to link the whole block to a type reference in its body
-		// ex:
-		// {
-		//    Date.prototype.__class__ = Date;
-		//    Date.__name__ = "Date";
-		//    var Int = { };
-		//  }
+		// Top-level blocks since Haxe 4.2+ for static __init__ code in ES6
+		// Link the whole block to a type reference in its body
+
+		// Blocks with NewExpression should stay in main bundle only
+		if (collectTypesInNode(def).length > 0) {
+			def.__tag__ = '__reserved__';
+			return;
+		}
+
 		var tagged = false;
 		tagHook = function(name, decl) {
 			if (decl == def) return false; // self-tagging
@@ -194,14 +208,39 @@ class Parser
 		tagHook = null;
 	}
 
+	function collectTypesInNode(blockNode:AstNode):Array<String>
+	{
+		final foundTypes = [];
+		final visitors = {
+			NewExpression: function(node:AstNode) {
+				if (node.callee != null && node.callee.type == 'Identifier') {
+					final name = node.callee.name;
+					if (types.exists(name) && foundTypes.indexOf(name) < 0) {
+						foundTypes.push(name);
+					}
+				}
+			}
+		};
+		ast.Acorn.Walk.recursive(blockNode, {}, visitors);
+		return foundTypes;
+	}
+
 	function inspectIfStatement(test:AstNode, def:AstNode)
 	{
+		// IfStatement with NewExpression should stay in main bundle only
+		if (collectTypesInNode(def).length > 0) {
+			def.__tag__ = '__reserved__';
+			return;
+		}
+
 		if (test.type == 'BinaryExpression')
 		{
-			// conditional prototype modification
 			// eg. if(ArrayBuffer.prototype.slice == null) {...}
+			// eg. if(SomeType.__staticField == null) {...}
 			final path = getIdentifier(test.left);
 			if (path.length > 1 && path[1] == 'prototype')
+				tag(path[0], def);
+			else if (path.length > 0 && types.exists(path[0]))
 				tag(path[0], def);
 		}
 		else if (test.type == 'ConditionalExpression')
@@ -332,6 +371,10 @@ class Parser
 							if (isEnumDecl(init))
 								isEnum.set(name, true);
 							tag(name, def);
+						case 'ArrayExpression':
+							// eg. var loaders = [new Foo(), new Bar()]
+							if (collectTypesInNode(init).length > 0)
+								def.__tag__ = '__reserved__';
 						case 'CallExpression':
 							if (isRequireDecl(init.callee))
 								required(name, def);
